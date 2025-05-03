@@ -4,13 +4,9 @@
 #include "benchmarks/common.h"
 #include "competitors/hybrid_pgm_lipp.h"
 
-template <typename Searcher>
+template <typename SearchClass>
 void benchmark_64_hybrid_pgm_lipp(tli::Benchmark<uint64_t>& benchmark, bool pareto, const std::vector<int>& params) {
-  if (!pareto) {
-    util::fail("HybridPGMLIPP requires pareto mode with fixed hyperparameters");
-  } else {
-    benchmark.template Run<HybridPGMLIPP<uint64_t, Searcher, 8>>();
-  }
+    benchmark.template Run<HybridPGMLIPP<uint64_t, SearchClass, 8>>(params);
 }
 
 template <int record>

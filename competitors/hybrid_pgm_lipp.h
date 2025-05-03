@@ -50,6 +50,7 @@ public:
         insert_count_++;
 
         if (insert_count_ >= flush_threshold_ && !flushing_.exchange(true)) {
+            if (flush_thread_.joinable()) flush_thread_.join();  // join safely
             flush_thread_ = std::thread(&HybridPGMLIPP::flush_to_lipp, this);
         }
     }

@@ -1,12 +1,12 @@
+// competitors/hybrid_pgm_lipp.h
 #pragma once
 
 #include "base.h"
 #include "dynamic_pgm_index.h"
 #include "lipp.h"
-#include <memory>
-#include <thread>
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 template<class KeyType, class SearchClass, size_t pgm_error>
@@ -21,73 +21,72 @@ public:
         if (flush_thread_.joinable()) flush_thread_.join();
     }
 
-    uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) override {
+    uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
         return lipp_index_.Build(data, num_threads);
     }
 
-    size_t EqualityLookup(const KeyType& key, uint32_t thread_id) const override {
+    size_t EqualityLookup(const KeyType& key, uint32_t thread_id) const {
         size_t result = dp_index_.EqualityLookup(key, thread_id);
         return (result == util::OVERFLOW || result == util::NOT_FOUND)
                    ? lipp_index_.EqualityLookup(key, thread_id)
                    : result;
     }
 
-    uint64_t RangeQuery(const KeyType& lo, const KeyType& hi, uint32_t thread_id) const override {
+    uint64_t RangeQuery(const KeyType& lo, const KeyType& hi, uint32_t thread_id) const {
         return dp_index_.RangeQuery(lo, hi, thread_id) + lipp_index_.RangeQuery(lo, hi, thread_id);
     }
 
-    void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) override {
-        if (flushing_.load()) {
-            lipp_index_.Insert(data, thread_id);
-            return;
-        }
-
+    void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
         {
             std::lock_guard<std::mutex> guard(buffer_mutex_);
             insert_buffer_.emplace_back(data);
+            ++insert_count_;
         }
 
         dp_index_.Insert(data, thread_id);
-        insert_count_++;
 
         if (insert_count_ >= flush_threshold_ && !flushing_.exchange(true)) {
-            if (flush_thread_.joinable()) flush_thread_.join();
+            if (flush_thread_.joinable()) flush_thread_.join();  // Wait safely
             flush_thread_ = std::thread(&HybridPGMLIPP::flush_to_lipp, this);
         }
     }
 
-    std::string name() const override {
+    std::string name() const {
         return "HybridPGMLIPP";
     }
 
-    std::vector<std::string> variants() const override {
+    std::vector<std::string> variants() const {
         return { SearchClass::name(), std::to_string(pgm_error) };
     }
 
-    size_t size() const override {
+    size_t size() const {
         return dp_index_.size() + lipp_index_.size();
     }
 
     bool applicable(bool unique, bool range_query, bool insert, bool multithread,
-                    const std::string& ops_filename) const override {
+                    const std::string& ops_filename) const {
         return !multithread;
     }
 
 private:
     void flush_to_lipp() {
-        std::vector<KeyValue<KeyType>> snapshot;
+        std::vector<KeyValue<KeyType>> buffer_snapshot;
         {
             std::lock_guard<std::mutex> guard(buffer_mutex_);
-            snapshot.swap(insert_buffer_);
+            buffer_snapshot.swap(insert_buffer_);
             insert_count_ = 0;
         }
 
-        for (const auto& kv : snapshot) {
+        // Bulk insert into LIPP
+        for (const auto& kv : buffer_snapshot) {
             lipp_index_.Insert(kv, 0);
         }
 
-        // Reconstruct DPGM with empty buffer to reduce overhead
-        dp_index_ = DynamicPGM<KeyType, SearchClass, pgm_error>(std::vector<int>());
+        // Rebuild dp_index_ from empty for best performance
+        std::vector<KeyValue<KeyType>> empty;
+        DynamicPGM<KeyType, SearchClass, pgm_error> new_dp(empty);  // Rebuild using constructor
+        dp_index_ = std::move(new_dp);
+
         flushing_ = false;
     }
 

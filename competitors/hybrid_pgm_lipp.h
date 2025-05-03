@@ -1,4 +1,3 @@
-// competitors/hybrid_pgm_lipp.h
 #pragma once
 
 #include "base.h"
@@ -8,8 +7,9 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
-#include <optional>
+#include <vector>
 
+// Final version of HybridPGMLIPP with safe flush and no reassignment of dp_index_
 template<class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 public:
@@ -19,9 +19,7 @@ public:
     }
 
     ~HybridPGMLIPP() {
-        if (flush_thread_ && flush_thread_->joinable()) {
-            flush_thread_->join();
-        }
+        if (flush_thread_.joinable()) flush_thread_.join();
     }
 
     uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
@@ -31,8 +29,8 @@ public:
     size_t EqualityLookup(const KeyType& key, uint32_t thread_id) const {
         size_t result = dp_index_.EqualityLookup(key, thread_id);
         return (result == util::OVERFLOW || result == util::NOT_FOUND)
-                   ? lipp_index_.EqualityLookup(key, thread_id)
-                   : result;
+            ? lipp_index_.EqualityLookup(key, thread_id)
+            : result;
     }
 
     uint64_t RangeQuery(const KeyType& lo, const KeyType& hi, uint32_t thread_id) const {
@@ -44,14 +42,11 @@ public:
             std::lock_guard<std::mutex> guard(buffer_mutex_);
             insert_buffer_.emplace_back(data);
         }
-
         dp_index_.Insert(data, thread_id);
         insert_count_++;
 
         if (insert_count_ >= flush_threshold_ && !flushing_.exchange(true)) {
-            if (flush_thread_ && flush_thread_->joinable()) {
-                flush_thread_->join();
-            }
+            if (flush_thread_.joinable()) flush_thread_.join();
             flush_thread_ = std::thread(&HybridPGMLIPP::flush_to_lipp, this);
         }
     }
@@ -81,15 +76,10 @@ private:
             snapshot.swap(insert_buffer_);
             insert_count_ = 0;
         }
-
         for (const auto& kv : snapshot) {
             lipp_index_.Insert(kv, 0);
         }
-
-        // Create a fresh DPGM and swap in (avoid destructor in active use)
-        DynamicPGM<KeyType, SearchClass, pgm_error> new_dp;
-        std::swap(dp_index_, new_dp);
-
+        // Do NOT reset or reassign dp_index_!
         flushing_ = false;
     }
 
@@ -101,6 +91,6 @@ private:
     size_t insert_count_;
     size_t flush_threshold_;
 
-    std::optional<std::thread> flush_thread_;
+    std::thread flush_thread_;
     std::atomic<bool> flushing_;
 };

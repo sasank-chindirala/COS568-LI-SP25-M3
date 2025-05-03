@@ -11,7 +11,7 @@ void benchmark_64_hybrid_pgm_lipp(tli::Benchmark<uint64_t>& benchmark, bool pare
 
 template <int record>
 void benchmark_64_hybrid_pgm_lipp(tli::Benchmark<uint64_t>& benchmark, const std::string& filename) {
-    benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 128>>();
+    benchmark.template Run<HybridPGMLIPP<uint64_t, BinarySearch, 128>>();
 }
 
 INSTANTIATE_TEMPLATES_MULTITHREAD(benchmark_64_hybrid_pgm_lipp, uint64_t);

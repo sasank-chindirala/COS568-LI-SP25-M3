@@ -9,17 +9,14 @@
 #include <mutex>
 #include <vector>
 #include <string>
-#include <cmath>
 
 template<class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 public:
     HybridPGMLIPP(const std::vector<int>& params)
-        : dp_index_(params), lipp_index_(params), insert_count_(0),
-          flushing_(false), insert_ratio_high_(false), initialized_(false)
-    {
-        // flush_threshold_ will be set dynamically in applicable()
-    }
+        : dp_index_(params), lipp_index_(params), insert_count_(0), flushing_(false),
+          flush_threshold_(100000), insert_ratio_high_(false)
+    {}
 
     ~HybridPGMLIPP() {
         if (flush_thread_.joinable()) flush_thread_.join();
@@ -42,7 +39,7 @@ public:
 
     void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
         if (!insert_ratio_high_) {
-            lipp_index_.Insert(data, thread_id);  // Direct to LIPP for low-insert workloads
+            lipp_index_.Insert(data, thread_id);
             return;
         }
 
@@ -50,7 +47,6 @@ public:
             std::lock_guard<std::mutex> guard(buffer_mutex_);
             insert_buffer_.emplace_back(data);
         }
-
         dp_index_.Insert(data, thread_id);
         insert_count_++;
 
@@ -72,20 +68,15 @@ public:
         return dp_index_.size() + lipp_index_.size();
     }
 
-    // Detect insert ratio from ops filename, tune behavior accordingly
+    // Infer insert ratio from filename and adjust behavior
     bool applicable(bool unique, bool range_query, bool insert, bool multithread,
                     const std::string& ops_filename) const {
-        if (initialized_) return !multithread;
-
         if (ops_filename.find("0.900000i") != std::string::npos) {
             insert_ratio_high_ = true;
-            flush_threshold_ = 50000;  // Tune lower to flush more frequently for 1.8M inserts
+            flush_threshold_ = 50000;
         } else {
             insert_ratio_high_ = false;
-            flush_threshold_ = 0;  // unused
         }
-
-        initialized_ = true;
         return !multithread;
     }
 
@@ -97,11 +88,9 @@ private:
             snapshot.swap(insert_buffer_);
             insert_count_ = 0;
         }
-
         for (const auto& kv : snapshot) {
             lipp_index_.Insert(kv, 0);
         }
-
         flushing_ = false;
     }
 
@@ -111,11 +100,9 @@ private:
     std::vector<KeyValue<KeyType>> insert_buffer_;
     std::mutex buffer_mutex_;
     size_t insert_count_;
-    size_t flush_threshold_;
+    mutable size_t flush_threshold_;
     std::atomic<bool> flushing_;
     std::thread flush_thread_;
 
     mutable bool insert_ratio_high_;
-    mutable bool initialized_;
-    mutable size_t flush_threshold_;
 };

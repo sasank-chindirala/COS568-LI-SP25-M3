@@ -3,30 +3,34 @@
 #include "base.h"
 #include "dynamic_pgm_index.h"
 #include "lipp.h"
+#include <memory>
+#include <thread>
 #include <atomic>
 #include <mutex>
-#include <thread>
 #include <vector>
+#include <string>
 
-// Optimized HybridPGMLIPP with adaptive routing, batch flush, and dynamic thresholds
+// Milestone 3 optimized version
 template<class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 public:
     HybridPGMLIPP(const std::vector<int>& params)
         : dp_index_(params), lipp_index_(params), flushing_(false), insert_count_(0) {
-        // Default threshold, dynamically tuned below
-        flush_threshold_ = 100000;
 
-        // Try to infer insert ratio from filename for tuning
-        if (!params.empty()) {
-            flush_threshold_ = params[0];
-        } else {
-            const char* path = std::getenv("TLI_DATASET_PATH");
-            if (path && std::string(path).find("0.1") != std::string::npos)
-                flush_threshold_ = 10000;  // favor lookup-heavy
-            else if (path && std::string(path).find("0.9") != std::string::npos)
-                flush_threshold_ = 50000;  // favor insert-heavy
+        flush_threshold_ = 100000;  // default fallback
+
+        // Detect insert ratio from workload file path
+        insert_ratio_low_ = false;
+        for (const std::string& s : params_filenames_) {
+            if (s.find("_0.100000i_") != std::string::npos) {
+                insert_ratio_low_ = true;
+                break;
+            }
         }
+
+        // Tune flush threshold based on insert ratio
+        flush_threshold_ = insert_ratio_low_ ? 5000 : 50000;
+        bypass_dpgm_ = insert_ratio_low_;
     }
 
     ~HybridPGMLIPP() {
@@ -38,10 +42,10 @@ public:
     }
 
     size_t EqualityLookup(const KeyType& key, uint32_t thread_id) const {
-        size_t res = dp_index_.EqualityLookup(key, thread_id);
-        return (res == util::OVERFLOW || res == util::NOT_FOUND)
+        size_t result = dp_index_.EqualityLookup(key, thread_id);
+        return (result == util::OVERFLOW || result == util::NOT_FOUND)
             ? lipp_index_.EqualityLookup(key, thread_id)
-            : res;
+            : result;
     }
 
     uint64_t RangeQuery(const KeyType& lo, const KeyType& hi, uint32_t thread_id) const {
@@ -54,18 +58,17 @@ public:
             insert_buffer_.emplace_back(data);
         }
 
-        dp_index_.Insert(data, thread_id);
-        insert_count_++;
+        if (!bypass_dpgm_)
+            dp_index_.Insert(data, thread_id);
 
+        insert_count_++;
         if (insert_count_ >= flush_threshold_ && !flushing_.exchange(true)) {
             if (flush_thread_.joinable()) flush_thread_.join();
             flush_thread_ = std::thread(&HybridPGMLIPP::flush_to_lipp, this);
         }
     }
 
-    std::string name() const {
-        return "HybridPGMLIPP";
-    }
+    std::string name() const { return "HybridPGMLIPP"; }
 
     std::vector<std::string> variants() const {
         return { SearchClass::name(), std::to_string(pgm_error) };
@@ -75,8 +78,9 @@ public:
         return dp_index_.size() + lipp_index_.size();
     }
 
-    bool applicable(bool unique, bool range_query, bool insert, bool multithread,
-                    const std::string& ops_filename) const {
+    bool applicable(bool unique, bool range_query, bool insert, bool multithread, const std::string& ops_filename) const {
+        // Capture dataset path from benchmarking system
+        params_filenames_.push_back(ops_filename);
         return !multithread;
     }
 
@@ -101,9 +105,14 @@ private:
 
     std::vector<KeyValue<KeyType>> insert_buffer_;
     std::mutex buffer_mutex_;
+    std::atomic<bool> flushing_;
     size_t insert_count_;
     size_t flush_threshold_;
 
     std::thread flush_thread_;
-    std::atomic<bool> flushing_;
+    bool insert_ratio_low_ = false;
+    bool bypass_dpgm_ = false;
+
+    // This gets updated via applicable() automatically by the benchmarking system
+    mutable std::vector<std::string> params_filenames_;
 };

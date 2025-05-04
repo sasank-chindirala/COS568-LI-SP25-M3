@@ -21,14 +21,17 @@ public:
         // default thresholds
         flush_threshold_low_ = 5000;      // for low insert-ratio workloads
         flush_threshold_high_ = 50000;    // for high insert-ratio workloads
-        // infer insert ratio from filename in applicable(), defaults to high
+        // flags initialized false; will be set in applicable()
         insert_ratio_low_ = false;
         bypass_dpgm_ = false;
+        insert_ratio_flag_set_ = false;
     }
 
     ~HybridPGMLIPP() {
         // wait for any in-flight flush
-        if (flush_thread_.joinable()) flush_thread_.join();
+        if (flush_thread_.joinable()) {
+            flush_thread_.join();
+        }
     }
 
     uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
@@ -65,11 +68,9 @@ public:
         size_t threshold = insert_ratio_low_ ? flush_threshold_low_ : flush_threshold_high_;
         if (insert_count_ >= threshold && !flush_pending_.exchange(true)) {
             // swap buffers
-            {
-                std::lock_guard<std::mutex> lock(buf_mutex_);
-                std::swap(active_buf_, flush_buf_);
-                insert_count_ = 0;
-            }
+            std::lock_guard<std::mutex> lock(buf_mutex_);
+            std::swap(active_buf_, flush_buf_);
+            insert_count_ = 0;
             // launch non-blocking flush thread
             flush_thread_ = std::thread(&HybridPGMLIPP::flush_worker, this);
         }
@@ -79,7 +80,6 @@ public:
     std::vector<std::string> variants() const {
         return { SearchClass::name(), std::to_string(pgm_error) };
     }
-
     std::size_t size() const {
         return dp_index_.size() + lipp_index_.size();
     }
@@ -127,6 +127,6 @@ private:
 
     // workload flags
     mutable bool insert_ratio_low_;
-    mutable bool insert_ratio_flag_set_ = false;
-    bool bypass_dpgm_;
+    mutable bool insert_ratio_flag_set_;
+    mutable bool bypass_dpgm_;
 };

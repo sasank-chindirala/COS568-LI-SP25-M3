@@ -8,70 +8,72 @@
 #include <atomic>
 #include <mutex>
 
-// HybridPGMLIPP with double-buffered asynchronous flushing and dynamic threshold tuning
+// HybridPGMLIPP with double-buffered async flush, dynamic thresholds, and thread-safe LIPP access
 template<class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 public:
     HybridPGMLIPP(const std::vector<int>& params)
-        : dp_index_(params),
-          lipp_index_(params),
-          flush_pending_(false),
-          insert_count_(0)
+      : dp_index_(params),
+        lipp_index_(params),
+        flush_pending_(false),
+        insert_count_(0)
     {
-        // default thresholds
-        flush_threshold_low_ = 5000;      // for low insert-ratio workloads
-        flush_threshold_high_ = 50000;    // for high insert-ratio workloads
-        // flags initialized false; will be set in applicable()
-        insert_ratio_low_ = false;
-        bypass_dpgm_ = false;
+        // tuning knobs
+        flush_threshold_low_  = 5'000;    // for 10%‑insert workloads
+        flush_threshold_high_ = 50'000;   // for 90%‑insert workloads
+
+        insert_ratio_low_      = false;
+        bypass_dpgm_           = false;
         insert_ratio_flag_set_ = false;
     }
 
     ~HybridPGMLIPP() {
-        // wait for any in-flight flush
-        if (flush_thread_.joinable()) {
+        if (flush_thread_.joinable())
             flush_thread_.join();
-        }
     }
 
+    // build the LIPP over the bulk data
     uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
-        // build primary LIPP base, DPGM empty
         return lipp_index_.Build(data, num_threads);
     }
 
+    // lookup checks DPGM first, then LIPP under lock
     size_t EqualityLookup(const KeyType& key, uint32_t thread_id) const {
-        // first check DPGM buffer
         size_t res = dp_index_.EqualityLookup(key, thread_id);
         if (res != util::NOT_FOUND && res != util::OVERFLOW)
             return res;
-        // then LIPP
+
+        std::lock_guard<std::mutex> lock(lipp_mutex_);
         return lipp_index_.EqualityLookup(key, thread_id);
     }
 
     uint64_t RangeQuery(const KeyType& lo, const KeyType& hi, uint32_t thread_id) const {
-        return dp_index_.RangeQuery(lo, hi, thread_id)
-             + lipp_index_.RangeQuery(lo, hi, thread_id);
+        uint64_t r1 = dp_index_.RangeQuery(lo, hi, thread_id);
+        std::lock_guard<std::mutex> lock(lipp_mutex_);
+        uint64_t r2 = lipp_index_.RangeQuery(lo, hi, thread_id);
+        return r1 + r2;
     }
 
+    // Insert into DPGM (unless bypassed), buffer it, and trigger an async flush
     void Insert(const KeyValue<KeyType>& kv, uint32_t thread_id) {
-        // 1) route to DPGM if not bypassing
         if (!bypass_dpgm_) {
             dp_index_.Insert(kv, thread_id);
         }
-        // 2) buffer for asynchronous flush to LIPP
+
         {
-            std::lock_guard<std::mutex> lock(buf_mutex_);
+            std::lock_guard<std::mutex> buf_lock(buf_mutex_);
             active_buf_.push_back(kv);
             ++insert_count_;
         }
-        // 3) trigger flush if threshold reached
+
         size_t threshold = insert_ratio_low_ ? flush_threshold_low_ : flush_threshold_high_;
         if (insert_count_ >= threshold && !flush_pending_.exchange(true)) {
-            // swap buffers
-            std::lock_guard<std::mutex> lock(buf_mutex_);
-            std::swap(active_buf_, flush_buf_);
-            insert_count_ = 0;
-            // launch non-blocking flush thread
+            {
+                std::lock_guard<std::mutex> buf_lock(buf_mutex_);
+                std::swap(active_buf_, flush_buf_);
+                insert_count_ = 0;
+            }
+            // launch a non‑blocking flush
             flush_thread_ = std::thread(&HybridPGMLIPP::flush_worker, this);
         }
     }
@@ -84,16 +86,16 @@ public:
         return dp_index_.size() + lipp_index_.size();
     }
 
+    // called once per benchmark run to detect insert ratio
     bool applicable(bool unique, bool range_query, bool insert,
                     bool multithread, const std::string& ops_filename) const
     {
-        // only single-threaded hybrid
-        if (multithread) return false;
-        // infer insert ratio from filename once
+        if (multithread) return false;  // hybrid is single‑threaded
+
         if (!insert_ratio_flag_set_) {
             if (ops_filename.find("_0.100000i_") != std::string::npos) {
                 insert_ratio_low_ = true;
-                bypass_dpgm_ = true;  // skip DPGM in low-insert workloads
+                bypass_dpgm_      = true;   // for 10% inserts we skip DPGM to maximize throughput
             }
             insert_ratio_flag_set_ = true;
         }
@@ -102,31 +104,40 @@ public:
 
 private:
     void flush_worker() {
-        // insert all buffered items into LIPP
-        for (const auto& kv : flush_buf_) {
-            lipp_index_.Insert(kv, /*thread=*/0);
+        // move out the batch
+        std::vector<KeyValue<KeyType>> batch;
+        {
+            std::lock_guard<std::mutex> buf_lock(buf_mutex_);
+            batch.swap(flush_buf_);
         }
-        // clear flush buffer
-        flush_buf_.clear();
-        // allow next flush
+        // insert them into LIPP under lock
+        {
+            std::lock_guard<std::mutex> lock(lipp_mutex_);
+            for (auto &kv : batch) {
+                lipp_index_.Insert(kv, /*thread=*/0);
+            }
+        }
         flush_pending_ = false;
     }
 
     DynamicPGM<KeyType, SearchClass, pgm_error> dp_index_;
-    Lipp<KeyType> lipp_index_;
+    Lipp<KeyType>                      lipp_index_;
 
-    // double buffers for async flush
+    // double‑buffer for async flush
     std::vector<KeyValue<KeyType>> active_buf_, flush_buf_;
-    mutable std::mutex buf_mutex_;
-    std::atomic<bool> flush_pending_;
-    std::thread flush_thread_;
+    mutable std::mutex             buf_mutex_;
+    std::atomic<size_t>            insert_count_;
+    std::atomic<bool>              flush_pending_;
+    std::thread                    flush_thread_;
 
-    // insert counters and thresholds
-    std::atomic<size_t> insert_count_;
+    // guard all LIPP calls
+    mutable std::mutex lipp_mutex_;
+
+    // thresholds
     size_t flush_threshold_low_, flush_threshold_high_;
 
-    // workload flags
+    // workload flags (need mutable so applicable() can set them)
     mutable bool insert_ratio_low_;
-    mutable bool insert_ratio_flag_set_;
     mutable bool bypass_dpgm_;
+    mutable bool insert_ratio_flag_set_;
 };

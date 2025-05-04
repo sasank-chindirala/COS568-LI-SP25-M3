@@ -117,4 +117,5 @@ private:
 
     mutable bool insert_ratio_high_;
     mutable bool initialized_;
+    mutable size_t flush_threshold_;
 };

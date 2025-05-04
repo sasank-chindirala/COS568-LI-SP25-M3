@@ -14,11 +14,9 @@ template<class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 public:
     HybridPGMLIPP(const std::vector<int>& params)
-        : dp_index_(params), lipp_index_(params), insert_ratio_high_(false)
+        : dp_index_(params), lipp_index_(params), insert_count_(0), flushing_(false), insert_ratio_high_(false)
     {
-        flush_threshold_ = 200000; // only used when insert_ratio_high_ == true
-        insert_count_ = 0;
-        flushing_ = false;
+        flush_threshold_ = 100000;  // Used only when insert_ratio_high_ is true
     }
 
     ~HybridPGMLIPP() {
@@ -30,6 +28,9 @@ public:
     }
 
     size_t EqualityLookup(const KeyType& key, uint32_t thread_id) const {
+        if (!insert_ratio_high_) {
+            return lipp_index_.EqualityLookup(key, thread_id);  // Skip DPGM
+        }
         size_t result = dp_index_.EqualityLookup(key, thread_id);
         return (result == util::OVERFLOW || result == util::NOT_FOUND)
             ? lipp_index_.EqualityLookup(key, thread_id)
@@ -37,12 +38,15 @@ public:
     }
 
     uint64_t RangeQuery(const KeyType& lo, const KeyType& hi, uint32_t thread_id) const {
+        if (!insert_ratio_high_) {
+            return lipp_index_.RangeQuery(lo, hi, thread_id);  // Skip DPGM
+        }
         return dp_index_.RangeQuery(lo, hi, thread_id) + lipp_index_.RangeQuery(lo, hi, thread_id);
     }
 
     void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
         if (!insert_ratio_high_) {
-            lipp_index_.Insert(data, thread_id);
+            lipp_index_.Insert(data, thread_id);  // Skip DPGM entirely
             return;
         }
 
@@ -71,6 +75,7 @@ public:
         return dp_index_.size() + lipp_index_.size();
     }
 
+    // Infer insert ratio from ops filename to guide insert behavior
     bool applicable(bool unique, bool range_query, bool insert, bool multithread,
                     const std::string& ops_filename) const {
         if (ops_filename.find("0.900000i") != std::string::npos)
@@ -104,5 +109,5 @@ private:
     std::atomic<bool> flushing_;
     std::thread flush_thread_;
 
-    mutable bool insert_ratio_high_;
+    mutable bool insert_ratio_high_;  // dynamically set in `applicable()`
 };

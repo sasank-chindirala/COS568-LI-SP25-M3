@@ -9,15 +9,16 @@
 #include <mutex>
 #include <vector>
 #include <string>
-#include <regex>
 
 template<class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 public:
     HybridPGMLIPP(const std::vector<int>& params)
-        : dp_index_(params), lipp_index_(params),
-          insert_count_(0), flushing_(false),
-          insert_ratio_high_(false), flush_threshold_(50000) {
+        : dp_index_(params), lipp_index_(params), insert_ratio_high_(false)
+    {
+        flush_threshold_ = 200000; // only used when insert_ratio_high_ == true
+        insert_count_ = 0;
+        flushing_ = false;
     }
 
     ~HybridPGMLIPP() {
@@ -72,8 +73,10 @@ public:
 
     bool applicable(bool unique, bool range_query, bool insert, bool multithread,
                     const std::string& ops_filename) const {
-        // Safely infer insert ratio from filename
-        insert_ratio_high_ = ops_filename.find("0.900000i") != std::string::npos;
+        if (ops_filename.find("0.900000i") != std::string::npos)
+            insert_ratio_high_ = true;
+        else
+            insert_ratio_high_ = false;
         return !multithread;
     }
 
@@ -97,10 +100,9 @@ private:
     std::vector<KeyValue<KeyType>> insert_buffer_;
     std::mutex buffer_mutex_;
     size_t insert_count_;
-    const size_t flush_threshold_;  // fixed at 50,000 for high insert workloads
-
+    size_t flush_threshold_;
     std::atomic<bool> flushing_;
     std::thread flush_thread_;
 
-    mutable bool insert_ratio_high_;  // flag set by `applicable()` based on filename
+    mutable bool insert_ratio_high_;
 };

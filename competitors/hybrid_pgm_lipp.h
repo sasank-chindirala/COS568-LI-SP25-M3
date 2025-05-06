@@ -14,9 +14,10 @@ template<class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 public:
     HybridPGMLIPP(const std::vector<int>& params)
-        : dp_index_(params), lipp_index_(params), insert_count_(0), flushing_(false), insert_ratio_high_(false)
-    {
-        flush_threshold_ = 100000;  // Used only when insert_ratio_high_ is true
+        : dp_index_(params), lipp_index_(params),
+          insert_count_(0), flushing_(false),
+          total_ops_(0), total_inserts_(0) {
+        flush_threshold_ = 100000; // will be tuned dynamically in applicable()
     }
 
     ~HybridPGMLIPP() {
@@ -28,9 +29,14 @@ public:
     }
 
     size_t EqualityLookup(const KeyType& key, uint32_t thread_id) const {
-        if (!insert_ratio_high_) {
-            return lipp_index_.EqualityLookup(key, thread_id);  // Skip DPGM
+        // Search buffer first
+        {
+            std::lock_guard<std::mutex> guard(buffer_mutex_);
+            for (const auto& kv : insert_buffer_) {
+                if (kv.key == key) return kv.value;
+            }
         }
+
         size_t result = dp_index_.EqualityLookup(key, thread_id);
         return (result == util::OVERFLOW || result == util::NOT_FOUND)
             ? lipp_index_.EqualityLookup(key, thread_id)
@@ -38,24 +44,38 @@ public:
     }
 
     uint64_t RangeQuery(const KeyType& lo, const KeyType& hi, uint32_t thread_id) const {
-        if (!insert_ratio_high_) {
-            return lipp_index_.RangeQuery(lo, hi, thread_id);  // Skip DPGM
+        uint64_t sum = 0;
+
+        // Include matching values from the insert buffer
+        {
+            std::lock_guard<std::mutex> guard(buffer_mutex_);
+            for (const auto& kv : insert_buffer_) {
+                if (kv.key >= lo && kv.key <= hi)
+                    sum += kv.value;
+            }
         }
-        return dp_index_.RangeQuery(lo, hi, thread_id) + lipp_index_.RangeQuery(lo, hi, thread_id);
+
+        return sum + dp_index_.RangeQuery(lo, hi, thread_id)
+                   + lipp_index_.RangeQuery(lo, hi, thread_id);
     }
 
     void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
-        if (!insert_ratio_high_) {
-            lipp_index_.Insert(data, thread_id);  // Skip DPGM entirely
-            return;
-        }
+        total_ops_++;
+        total_inserts_++;
 
         {
             std::lock_guard<std::mutex> guard(buffer_mutex_);
             insert_buffer_.emplace_back(data);
         }
+
         dp_index_.Insert(data, thread_id);
         insert_count_++;
+
+        // Dynamic threshold adjustment after warmup
+        if (total_ops_ == 100000 && total_inserts_ > 0) {
+            double ratio = static_cast<double>(total_inserts_) / total_ops_;
+            flush_threshold_ = (ratio > 0.5) ? 100000 : 200000; // coarse but practical
+        }
 
         if (insert_count_ >= flush_threshold_ && !flushing_.exchange(true)) {
             if (flush_thread_.joinable()) flush_thread_.join();
@@ -75,13 +95,8 @@ public:
         return dp_index_.size() + lipp_index_.size();
     }
 
-    // Infer insert ratio from ops filename to guide insert behavior
     bool applicable(bool unique, bool range_query, bool insert, bool multithread,
                     const std::string& ops_filename) const {
-        if (ops_filename.find("0.900000i") != std::string::npos)
-            insert_ratio_high_ = true;
-        else
-            insert_ratio_high_ = false;
         return !multithread;
     }
 
@@ -93,9 +108,14 @@ private:
             snapshot.swap(insert_buffer_);
             insert_count_ = 0;
         }
+
         for (const auto& kv : snapshot) {
             lipp_index_.Insert(kv, 0);
         }
+
+        // Clear DPGM for reuse
+        dp_index_ = DynamicPGM<KeyType, SearchClass, pgm_error>(std::vector<int>{});
+
         flushing_ = false;
     }
 
@@ -109,5 +129,6 @@ private:
     std::atomic<bool> flushing_;
     std::thread flush_thread_;
 
-    mutable bool insert_ratio_high_;  // dynamically set in `applicable()`
+    size_t total_ops_;
+    size_t total_inserts_;
 };

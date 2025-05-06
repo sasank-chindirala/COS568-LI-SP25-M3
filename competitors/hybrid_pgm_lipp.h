@@ -14,9 +14,12 @@ template<class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 public:
     HybridPGMLIPP(const std::vector<int>& params)
-        : dp_index_(params), lipp_index_(params), insert_count_(0), flushing_(false), insert_ratio_high_(false)
+        : dp_index_(params), lipp_index_(params), insert_count_(0),
+          flushing_(false), insert_ratio_high_(false),
+          total_ops_(0), insert_ops_(0), threshold_ops_(100000),
+          insert_mode_decided_(false)
     {
-        flush_threshold_ = 100000;  // Used only when insert_ratio_high_ is true
+        flush_threshold_ = 100000;
     }
 
     ~HybridPGMLIPP() {
@@ -39,12 +42,22 @@ public:
 
     uint64_t RangeQuery(const KeyType& lo, const KeyType& hi, uint32_t thread_id) const {
         if (!insert_ratio_high_) {
-            return lipp_index_.RangeQuery(lo, hi, thread_id);  // Skip DPGM
+            return lipp_index_.RangeQuery(lo, hi, thread_id);
         }
         return dp_index_.RangeQuery(lo, hi, thread_id) + lipp_index_.RangeQuery(lo, hi, thread_id);
     }
 
     void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
+        if (!insert_mode_decided_) {
+            ++total_ops_;
+            ++insert_ops_;
+            if (total_ops_ >= threshold_ops_) {
+                double ratio = static_cast<double>(insert_ops_) / total_ops_;
+                insert_ratio_high_ = (ratio >= 0.5);
+                insert_mode_decided_ = true;
+            }
+        }
+
         if (!insert_ratio_high_) {
             lipp_index_.Insert(data, thread_id);  // Skip DPGM entirely
             return;
@@ -75,13 +88,8 @@ public:
         return dp_index_.size() + lipp_index_.size();
     }
 
-    // Infer insert ratio from ops filename to guide insert behavior
     bool applicable(bool unique, bool range_query, bool insert, bool multithread,
-                    const std::string& ops_filename) const {
-        if (ops_filename.find("0.900000i") != std::string::npos)
-            insert_ratio_high_ = true;
-        else
-            insert_ratio_high_ = false;
+                    const std::string& /*ops_filename*/) const {
         return !multithread;
     }
 
@@ -109,5 +117,9 @@ private:
     std::atomic<bool> flushing_;
     std::thread flush_thread_;
 
-    mutable bool insert_ratio_high_;  // dynamically set in `applicable()`
+    mutable bool insert_ratio_high_;
+    std::atomic<size_t> total_ops_;
+    std::atomic<size_t> insert_ops_;
+    const size_t threshold_ops_;
+    std::atomic<bool> insert_mode_decided_;
 };

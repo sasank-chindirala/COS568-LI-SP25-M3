@@ -17,7 +17,7 @@ public:
         : dp_index_(params), lipp_index_(params),
           insert_count_(0), flushing_(false),
           total_ops_(0), total_inserts_(0) {
-        flush_threshold_ = 100000; // will be tuned dynamically in applicable()
+        flush_threshold_ = 100000; // will be tuned dynamically
     }
 
     ~HybridPGMLIPP() {
@@ -29,7 +29,7 @@ public:
     }
 
     size_t EqualityLookup(const KeyType& key, uint32_t thread_id) const {
-        // Search buffer first
+        // Search unflushed buffer
         {
             std::lock_guard<std::mutex> guard(buffer_mutex_);
             for (const auto& kv : insert_buffer_) {
@@ -45,18 +45,16 @@ public:
 
     uint64_t RangeQuery(const KeyType& lo, const KeyType& hi, uint32_t thread_id) const {
         uint64_t sum = 0;
-
-        // Include matching values from the insert buffer
         {
             std::lock_guard<std::mutex> guard(buffer_mutex_);
             for (const auto& kv : insert_buffer_) {
-                if (kv.key >= lo && kv.key <= hi)
-                    sum += kv.value;
+                if (kv.key >= lo && kv.key <= hi) sum += kv.value;
             }
         }
 
-        return sum + dp_index_.RangeQuery(lo, hi, thread_id)
-                   + lipp_index_.RangeQuery(lo, hi, thread_id);
+        return sum +
+               dp_index_.RangeQuery(lo, hi, thread_id) +
+               lipp_index_.RangeQuery(lo, hi, thread_id);
     }
 
     void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
@@ -71,10 +69,10 @@ public:
         dp_index_.Insert(data, thread_id);
         insert_count_++;
 
-        // Dynamic threshold adjustment after warmup
+        // Adjust threshold after warmup
         if (total_ops_ == 100000 && total_inserts_ > 0) {
             double ratio = static_cast<double>(total_inserts_) / total_ops_;
-            flush_threshold_ = (ratio > 0.5) ? 100000 : 200000; // coarse but practical
+            flush_threshold_ = (ratio > 0.5) ? 100000 : 200000;
         }
 
         if (insert_count_ >= flush_threshold_ && !flushing_.exchange(true)) {
@@ -96,7 +94,7 @@ public:
     }
 
     bool applicable(bool unique, bool range_query, bool insert, bool multithread,
-                    const std::string& ops_filename) const {
+                    const std::string& /* ops_filename */) const {
         return !multithread;
     }
 
@@ -113,9 +111,8 @@ private:
             lipp_index_.Insert(kv, 0);
         }
 
-        // Clear DPGM for reuse
+        // Reset the staging index
         dp_index_ = DynamicPGM<KeyType, SearchClass, pgm_error>(std::vector<int>{});
-
         flushing_ = false;
     }
 
@@ -123,7 +120,7 @@ private:
     Lipp<KeyType> lipp_index_;
 
     std::vector<KeyValue<KeyType>> insert_buffer_;
-    std::mutex buffer_mutex_;
+    mutable std::mutex buffer_mutex_;  // fix: must be mutable for const access
     size_t insert_count_;
     size_t flush_threshold_;
     std::atomic<bool> flushing_;

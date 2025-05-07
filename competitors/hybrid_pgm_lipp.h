@@ -16,11 +16,11 @@ public:
     HybridPGMLIPP(const std::vector<int>& params)
         : dp_index_(params), lipp_index_(params),
           insert_count_(0), flushing_(false),
-          total_ops_(0), insert_ops_(0),
-          insert_ratio_high_(false), mode_decided_(false)
+          insert_ops_(0), total_ops_(0),
+          build_size_(0), insert_ratio_high_(false), mode_decided_(false)
     {
-        flush_threshold_ = 100000;  // Used only in high-insert mode
-        insert_check_threshold_ = 100000;  // Check after this many ops
+        flush_threshold_ = 100000;  // default threshold for high-insert workloads
+        insert_check_threshold_ = 10000;  // after this many ops, decide mode
     }
 
     ~HybridPGMLIPP() {
@@ -28,46 +28,44 @@ public:
     }
 
     uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
+        build_size_ = data.size();
         return lipp_index_.Build(data, num_threads);
     }
 
     size_t EqualityLookup(const KeyType& key, uint32_t thread_id) const {
-        // Lookup is never counted in ops, so no race
         if (!insert_ratio_high_) {
             return lipp_index_.EqualityLookup(key, thread_id);
         }
         size_t result = dp_index_.EqualityLookup(key, thread_id);
         return (result == util::OVERFLOW || result == util::NOT_FOUND)
-             ? lipp_index_.EqualityLookup(key, thread_id)
-             : result;
+            ? lipp_index_.EqualityLookup(key, thread_id)
+            : result;
     }
 
     uint64_t RangeQuery(const KeyType& lo, const KeyType& hi, uint32_t thread_id) const {
         if (!insert_ratio_high_) {
             return lipp_index_.RangeQuery(lo, hi, thread_id);
         }
-        return dp_index_.RangeQuery(lo, hi, thread_id) +
-               lipp_index_.RangeQuery(lo, hi, thread_id);
+        return dp_index_.RangeQuery(lo, hi, thread_id) + lipp_index_.RangeQuery(lo, hi, thread_id);
     }
 
     void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
-        size_t op_index = total_ops_.fetch_add(1, std::memory_order_relaxed);
-        insert_ops_.fetch_add(1, std::memory_order_relaxed);
+        size_t op_index = total_ops_.fetch_add(1);
+        insert_ops_.fetch_add(1);
 
-        // Infer mode early (once only, thread-safe)
         if (!mode_decided_ && op_index + 1 == insert_check_threshold_) {
-            double insert_ratio = static_cast<double>(insert_ops_.load()) / (op_index + 1);
-            insert_ratio_high_ = insert_ratio >= 0.45;  // Threshold works for your workload split
+            double ratio = static_cast<double>(insert_ops_.load()) / (insert_ops_.load() + build_size_);
+            insert_ratio_high_ = ratio > 0.01;  // inferred dynamically
             mode_decided_ = true;
         }
 
         if (!insert_ratio_high_) {
-            lipp_index_.Insert(data, thread_id);  // Use LIPP only
+            lipp_index_.Insert(data, thread_id);  // low-insert mode
             return;
         }
 
         {
-            std::lock_guard<std::mutex> lock(buffer_mutex_);
+            std::lock_guard<std::mutex> guard(buffer_mutex_);
             insert_buffer_.emplace_back(data);
         }
         dp_index_.Insert(data, thread_id);
@@ -92,7 +90,7 @@ public:
     }
 
     bool applicable(bool unique, bool range_query, bool insert, bool multithread,
-                    const std::string& /*ops_filename*/) const {
+                    const std::string&) const {
         return !multithread;
     }
 
@@ -100,7 +98,7 @@ private:
     void flush_to_lipp() {
         std::vector<KeyValue<KeyType>> snapshot;
         {
-            std::lock_guard<std::mutex> lock(buffer_mutex_);
+            std::lock_guard<std::mutex> guard(buffer_mutex_);
             snapshot.swap(insert_buffer_);
             insert_count_ = 0;
         }
@@ -120,10 +118,10 @@ private:
     std::atomic<bool> flushing_;
     std::thread flush_thread_;
 
-    // For true insert ratio inference
-    std::atomic<size_t> total_ops_;
     std::atomic<size_t> insert_ops_;
-    size_t insert_check_threshold_;
+    std::atomic<size_t> total_ops_;
+    size_t build_size_;
     mutable bool insert_ratio_high_;
-    std::atomic<bool> mode_decided_;
+    mutable bool mode_decided_;
+    size_t insert_check_threshold_;
 };

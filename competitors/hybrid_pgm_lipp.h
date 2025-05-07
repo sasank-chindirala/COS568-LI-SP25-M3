@@ -19,8 +19,8 @@ public:
           insert_ops_(0), total_ops_(0),
           build_size_(0), insert_ratio_high_(false), mode_decided_(false)
     {
-        flush_threshold_ = 100000;  // default threshold for high-insert workloads
-        insert_check_threshold_ = 10000;  // after this many ops, decide mode
+        flush_threshold_ = 100000;          // Flush DPGM every 100k inserts
+        insert_check_threshold_ = 500;      // Infer insert mode after 500 ops
     }
 
     ~HybridPGMLIPP() {
@@ -53,17 +53,21 @@ public:
         size_t op_index = total_ops_.fetch_add(1);
         insert_ops_.fetch_add(1);
 
+        // Early insert ratio inference (after first 500 ops)
         if (!mode_decided_ && op_index + 1 == insert_check_threshold_) {
-            double ratio = static_cast<double>(insert_ops_.load()) / (insert_ops_.load() + build_size_);
-            insert_ratio_high_ = ratio > 0.01;  // inferred dynamically
+            double ratio = static_cast<double>(insert_ops_.load()) /
+                           (insert_ops_.load() + build_size_);
+            insert_ratio_high_ = (ratio > 0.01);
             mode_decided_ = true;
         }
 
+        // Low-insert mode: send all inserts directly to LIPP
         if (!insert_ratio_high_) {
-            lipp_index_.Insert(data, thread_id);  // low-insert mode
+            lipp_index_.Insert(data, thread_id);
             return;
         }
 
+        // High-insert mode: buffer insert for flush to LIPP
         {
             std::lock_guard<std::mutex> guard(buffer_mutex_);
             insert_buffer_.emplace_back(data);
@@ -74,6 +78,7 @@ public:
         if (insert_count_ >= flush_threshold_ && !flushing_.exchange(true)) {
             if (flush_thread_.joinable()) flush_thread_.join();
             flush_thread_ = std::thread(&HybridPGMLIPP::flush_to_lipp, this);
+            dp_index_ = DynamicPGM<KeyType, SearchClass, pgm_error>(std::vector<int>());
         }
     }
 
@@ -89,9 +94,10 @@ public:
         return dp_index_.size() + lipp_index_.size();
     }
 
-    bool applicable(bool unique, bool range_query, bool insert, bool multithread,
-                    const std::string&) const {
-        return !multithread;
+    // No longer relies on filename for insert ratio inference
+    bool applicable(bool unique, bool /*range_query*/, bool /*insert*/,
+                    bool multithread, const std::string& /*unused*/) const override {
+        return !multithread && unique;
     }
 
 private:

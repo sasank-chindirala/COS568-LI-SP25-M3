@@ -14,12 +14,13 @@ template<class KeyType, class SearchClass, size_t pgm_error>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 public:
     HybridPGMLIPP(const std::vector<int>& params)
-        : dp_index_(params), lipp_index_(params), insert_count_(0),
-          flushing_(false), insert_ratio_high_(false),
-          total_ops_(0), insert_ops_(0), threshold_ops_(100000),
-          insert_mode_decided_(false)
+        : dp_index_(params), lipp_index_(params),
+          insert_count_(0), flushing_(false),
+          total_ops_(0), insert_ops_(0),
+          insert_ratio_high_(false), mode_decided_(false)
     {
-        flush_threshold_ = 100000;
+        flush_threshold_ = 100000;  // Used only in high-insert mode
+        insert_check_threshold_ = 100000;  // Check after this many ops
     }
 
     ~HybridPGMLIPP() {
@@ -31,40 +32,42 @@ public:
     }
 
     size_t EqualityLookup(const KeyType& key, uint32_t thread_id) const {
+        // Lookup is never counted in ops, so no race
         if (!insert_ratio_high_) {
-            return lipp_index_.EqualityLookup(key, thread_id);  // Skip DPGM
+            return lipp_index_.EqualityLookup(key, thread_id);
         }
         size_t result = dp_index_.EqualityLookup(key, thread_id);
         return (result == util::OVERFLOW || result == util::NOT_FOUND)
-            ? lipp_index_.EqualityLookup(key, thread_id)
-            : result;
+             ? lipp_index_.EqualityLookup(key, thread_id)
+             : result;
     }
 
     uint64_t RangeQuery(const KeyType& lo, const KeyType& hi, uint32_t thread_id) const {
         if (!insert_ratio_high_) {
             return lipp_index_.RangeQuery(lo, hi, thread_id);
         }
-        return dp_index_.RangeQuery(lo, hi, thread_id) + lipp_index_.RangeQuery(lo, hi, thread_id);
+        return dp_index_.RangeQuery(lo, hi, thread_id) +
+               lipp_index_.RangeQuery(lo, hi, thread_id);
     }
 
     void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
-        if (!insert_mode_decided_) {
-            ++total_ops_;
-            ++insert_ops_;
-            if (total_ops_ >= threshold_ops_) {
-                double ratio = static_cast<double>(insert_ops_) / total_ops_;
-                insert_ratio_high_ = (ratio >= 0.5);
-                insert_mode_decided_ = true;
-            }
+        size_t op_index = total_ops_.fetch_add(1, std::memory_order_relaxed);
+        insert_ops_.fetch_add(1, std::memory_order_relaxed);
+
+        // Infer mode early (once only, thread-safe)
+        if (!mode_decided_ && op_index + 1 == insert_check_threshold_) {
+            double insert_ratio = static_cast<double>(insert_ops_.load()) / (op_index + 1);
+            insert_ratio_high_ = insert_ratio >= 0.45;  // Threshold works for your workload split
+            mode_decided_ = true;
         }
 
         if (!insert_ratio_high_) {
-            lipp_index_.Insert(data, thread_id);  // Skip DPGM entirely
+            lipp_index_.Insert(data, thread_id);  // Use LIPP only
             return;
         }
 
         {
-            std::lock_guard<std::mutex> guard(buffer_mutex_);
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
             insert_buffer_.emplace_back(data);
         }
         dp_index_.Insert(data, thread_id);
@@ -97,7 +100,7 @@ private:
     void flush_to_lipp() {
         std::vector<KeyValue<KeyType>> snapshot;
         {
-            std::lock_guard<std::mutex> guard(buffer_mutex_);
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
             snapshot.swap(insert_buffer_);
             insert_count_ = 0;
         }
@@ -117,9 +120,10 @@ private:
     std::atomic<bool> flushing_;
     std::thread flush_thread_;
 
-    mutable bool insert_ratio_high_;
+    // For true insert ratio inference
     std::atomic<size_t> total_ops_;
     std::atomic<size_t> insert_ops_;
-    const size_t threshold_ops_;
-    std::atomic<bool> insert_mode_decided_;
+    size_t insert_check_threshold_;
+    mutable bool insert_ratio_high_;
+    std::atomic<bool> mode_decided_;
 };

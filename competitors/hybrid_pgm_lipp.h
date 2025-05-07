@@ -95,9 +95,9 @@ public:
     }
 
     // No longer relies on filename for insert ratio inference
-    bool applicable(bool unique, bool /*range_query*/, bool /*insert*/,
-                    bool multithread, const std::string& /*unused*/) const override {
-        return !multithread && unique;
+     bool applicable(bool unique, bool range_query, bool insert, bool multithread,
+                    const std::string&) const {
+        return !multithread;
     }
 
 private:
